@@ -5163,3 +5163,27 @@ def CountedByRef : Builtin {
   let Attributes = [NoThrow, CustomTypeChecking];
   let Prototype = "int(...)";
 }
+
+def BuiltinDescribe : Builtin {
+  let Spellings = ["__builtin_describe"];
+  let Attributes = [CustomTypeChecking];
+  let Prototype = "void(...)";
+}
+
+def BuiltinVisitDataMembers : Builtin {
+  let Spellings = ["__builtin_visit_data_members"];
+  let Attributes = [CustomTypeChecking];
+  let Prototype = "void(...)";
+}
+
+def BuiltinVisitBases : Builtin {
+  let Spellings = ["__builtin_visit_bases"];
+  let Attributes = [CustomTypeChecking];
+  let Prototype = "void(...)";
+}
+
+def BuiltinVisitEnumerators : Builtin {
+  let Spellings = ["__builtin_visit_enumerators"];
+  let Attributes = [CustomTypeChecking];
+  let Prototype = "void(...)";
+}

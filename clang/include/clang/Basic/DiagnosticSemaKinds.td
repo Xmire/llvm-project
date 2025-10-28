@@ -9749,6 +9749,16 @@ def warn_redefine_extname_not_applied : Warning<
   "#pragma redefine_extname is applicable to external C declarations only; "
   "not applied to %select{function|variable}0 %1">,
   InGroup<Pragmas>;
+def note_building_builtin_describe_call : Note<
+  "in call to describe function with arguments '(%0)' while describing type">;
+def note_building_builtin_visit_data_members_call : Note<
+  "in call to visit function with arguments '(%0)' while visiting struct data members">;
+def note_building_builtin_visit_bases_call : Note<
+  "in call to visit function with arguments '(%0)' while visiting struct bases">;
+def note_building_builtin_visit_enumerators_call : Note<
+  "in call to visit function with arguments '(%0)' while visiting enumerators">;
+def err_expected_enum_argument : Error<
+  "expected enum as %ordinal0 argument to %1, found %2">;
 } // End of general sema category.
 
 // inline asm.

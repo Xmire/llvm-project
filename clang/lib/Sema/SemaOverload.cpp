@@ -14213,8 +14213,7 @@ bool Sema::ResolveAndFixSingleFunctionTemplateSpecialization(
 }
 
 /// Add a single candidate to the overload set.
-static void AddOverloadedCallCandidate(Sema &S,
-                                       DeclAccessPair FoundDecl,
+void Sema::AddOverloadedCallCandidate(DeclAccessPair FoundDecl,
                                  TemplateArgumentListInfo *ExplicitTemplateArgs,
                                        ArrayRef<Expr *> Args,
                                        OverloadCandidateSet &CandidateSet,
@@ -14233,7 +14232,7 @@ static void AddOverloadedCallCandidate(Sema &S,
     if (!isa<FunctionProtoType>(Func->getType()->getAs<FunctionType>()))
       return;
 
-    S.AddOverloadCandidate(Func, FoundDecl, Args, CandidateSet,
+    AddOverloadCandidate(Func, FoundDecl, Args, CandidateSet,
                            /*SuppressUserConversions=*/false,
                            PartialOverloading);
     return;
@@ -14241,7 +14240,7 @@ static void AddOverloadedCallCandidate(Sema &S,
 
   if (FunctionTemplateDecl *FuncTemplate
       = dyn_cast<FunctionTemplateDecl>(Callee)) {
-    S.AddTemplateOverloadCandidate(FuncTemplate, FoundDecl,
+    AddTemplateOverloadCandidate(FuncTemplate, FoundDecl,
                                    ExplicitTemplateArgs, Args, CandidateSet,
                                    /*SuppressUserConversions=*/false,
                                    PartialOverloading);
@@ -14295,7 +14294,7 @@ void Sema::AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
 
   for (UnresolvedLookupExpr::decls_iterator I = ULE->decls_begin(),
          E = ULE->decls_end(); I != E; ++I)
-    AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
+    AddOverloadedCallCandidate(I.getPair(), ExplicitTemplateArgs, Args,
                                CandidateSet, PartialOverloading,
                                /*KnownValid*/ true);
 
@@ -14309,7 +14308,7 @@ void Sema::AddOverloadedCallCandidates(
     LookupResult &R, TemplateArgumentListInfo *ExplicitTemplateArgs,
     ArrayRef<Expr *> Args, OverloadCandidateSet &CandidateSet) {
   for (LookupResult::iterator I = R.begin(), E = R.end(); I != E; ++I)
-    AddOverloadedCallCandidate(*this, I.getPair(), ExplicitTemplateArgs, Args,
+    AddOverloadedCallCandidate(I.getPair(), ExplicitTemplateArgs, Args,
                                CandidateSet, false, /*KnownValid*/ false);
 }
 

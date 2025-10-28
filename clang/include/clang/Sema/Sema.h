@@ -10685,6 +10685,12 @@ public:
 
   /// Add the overload candidates named by callee and/or found by argument
   /// dependent lookup to the given overload set.
+  void AddOverloadedCallCandidate(DeclAccessPair FoundDecl,
+                                   TemplateArgumentListInfo *ExplicitTemplateArgs,
+                                   ArrayRef<Expr *> Args,
+                                   OverloadCandidateSet &CandidateSet,
+                                   bool PartialOverloading,
+                                   bool KnownValid);
   void AddOverloadedCallCandidates(UnresolvedLookupExpr *ULE,
                                    ArrayRef<Expr *> Args,
                                    OverloadCandidateSet &CandidateSet,
@@ -13022,6 +13028,22 @@ public:
 
       /// We are performing partial ordering for template template parameters.
       PartialOrderingTTP,
+
+      /// We are building an implied call from __builtin_describe. The
+      /// arguments are in CallArgs.
+      BuildingBuiltinDescribeCall,
+
+      /// We are building an implied call from __builtin_visit_data_members. The
+      /// arguments are in CallArgs.
+      BuildingBuiltinVisitDataMembersCall,
+      
+      /// We are building an implied call from __builtin_visit_bases. The
+      /// arguments are in CallArgs.
+      BuildingBuiltinVisitBasesCall,
+
+      /// We are building an implied call from __builtin_visit_enumerators. The
+      /// arguments are in CallArgs.
+      BuildingBuiltinVisitEnumeratorsCall,
     } Kind;
 
     /// Was the enclosing context a non-instantiation SFINAE context?

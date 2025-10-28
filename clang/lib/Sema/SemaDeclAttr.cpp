@@ -6958,6 +6958,35 @@ static void handleVTablePointerAuthentication(Sema &S, Decl *D,
       CustomDiscriminationValue));
 }
 
+static void handleMetaAttr(Sema &S, Decl *D, const ParsedAttr &AL) {
+  TypeSourceInfo *MetadataTypeLoc = nullptr;
+  QualType ParmType;
+  if (AL.hasParsedType()) {
+    ParmType = S.GetTypeFromParser(AL.getTypeArg(), &MetadataTypeLoc);
+    //if (!ParmType->isAggregateType()) {
+    //  S.Diag(AL.getLoc(), diag::err_attribute_invalid_argument) << 0 << AL;
+    //  return;
+    //}
+  }
+  D = D->getCanonicalDecl();
+  if (const auto *MAttr = D->getAttr<MetaAttr>()) {
+    const Type *ExistingMetadataType = MAttr->getMetadataTypeLoc()
+                                        ? MAttr->getMetadataType().getTypePtr()
+                                        : nullptr;
+    if (ExistingMetadataType != ParmType.getTypePtrOrNull()) {
+      S.Diag(AL.getLoc(), diag::err_attributes_are_not_compatible)
+          << AL << MAttr
+          << (AL.isRegularKeywordAttribute() ||
+              MAttr->isRegularKeywordAttribute());
+      S.Diag(MAttr->getLocation(), diag::note_conflicting_attribute);
+    }
+    return;
+  }
+  for (Decl *Redecl : D->redecls()) {
+    Redecl->addAttr(::new (S.Context) MetaAttr(S.Context, AL, MetadataTypeLoc));
+  }
+}
+
 //===----------------------------------------------------------------------===//
 // Top Level Sema Entry Points
 //===----------------------------------------------------------------------===//
@@ -7881,6 +7910,9 @@ ProcessDeclAttribute(Sema &S, Scope *scope, Decl *D, const ParsedAttr &AL,
 
   case ParsedAttr::AT_VTablePointerAuthentication:
     handleVTablePointerAuthentication(S, D, AL);
+    break;
+  case ParsedAttr::AT_Meta:
+    handleMetaAttr(S, D, AL);
     break;
   }
 }

@@ -9427,3 +9427,18 @@ silence diagnostics with code like:
   __attribute__((nonstring)) char NotAStr[3] = "foo"; // Not diagnosed
   }];
 }
+
+def MetaAttrDocs : Documentation {
+  let Category = DocCatType;
+  let Heading = "meta";
+  let Content = [{
+The ``meta`` attribute applies to a field and binds another struct as a Metadata type.
+
+.. code-block:: c++
+
+  struct MyStruct {
+    [[meta(MetadataType)]] int someField;
+  };
+
+  }];
+}

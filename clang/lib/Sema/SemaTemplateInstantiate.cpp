@@ -583,6 +583,10 @@ bool Sema::CodeSynthesisContext::isInstantiationRecord() const {
   case InitializingStructuredBinding:
   case MarkingClassDllexported:
   case BuildingBuiltinDumpStructCall:
+  case BuildingBuiltinDescribeCall:
+  case BuildingBuiltinVisitDataMembersCall:
+  case BuildingBuiltinVisitBasesCall:
+  case BuildingBuiltinVisitEnumeratorsCall:
   case LambdaExpressionSubstitution:
   case BuildingDeductionGuides:
   case TypeAliasTemplateInstantiation:
@@ -1203,6 +1207,33 @@ void Sema::PrintInstantiationStack(InstantiationContextDiagFuncRef DiagFunc) {
                           *this, llvm::ArrayRef(Active->CallArgs,
                                                 Active->NumCallArgs)));
       break;
+    case CodeSynthesisContext::BuildingBuiltinDescribeCall:
+      Diags.Report(Active->PointOfInstantiation,
+                   diag::note_building_builtin_describe_call)
+          << convertCallArgsToString(
+                 *this, llvm::ArrayRef(Active->CallArgs, Active->NumCallArgs));
+      break;
+
+    case CodeSynthesisContext::BuildingBuiltinVisitDataMembersCall:
+      Diags.Report(Active->PointOfInstantiation,
+                   diag::note_building_builtin_visit_data_members_call)
+          << convertCallArgsToString(
+                 *this, llvm::ArrayRef(Active->CallArgs, Active->NumCallArgs));
+      break;
+      
+    case CodeSynthesisContext::BuildingBuiltinVisitBasesCall:
+      Diags.Report(Active->PointOfInstantiation,
+                   diag::note_building_builtin_visit_bases_call)
+          << convertCallArgsToString(
+                 *this, llvm::ArrayRef(Active->CallArgs, Active->NumCallArgs));
+      break;
+      
+    case CodeSynthesisContext::BuildingBuiltinVisitEnumeratorsCall:
+      Diags.Report(Active->PointOfInstantiation,
+                   diag::note_building_builtin_visit_enumerators_call)
+          << convertCallArgsToString(
+                 *this, llvm::ArrayRef(Active->CallArgs, Active->NumCallArgs));
+      break;
 
     case CodeSynthesisContext::Memoization:
       break;
@@ -1344,6 +1375,10 @@ std::optional<TemplateDeductionInfo *> Sema::isSFINAEContext() const {
     case CodeSynthesisContext::InitializingStructuredBinding:
     case CodeSynthesisContext::MarkingClassDllexported:
     case CodeSynthesisContext::BuildingBuiltinDumpStructCall:
+    case CodeSynthesisContext::BuildingBuiltinDescribeCall:
+    case CodeSynthesisContext::BuildingBuiltinVisitDataMembersCall:
+    case CodeSynthesisContext::BuildingBuiltinVisitBasesCall:
+    case CodeSynthesisContext::BuildingBuiltinVisitEnumeratorsCall:
     case CodeSynthesisContext::BuildingDeductionGuides:
       // This happens in a context unrelated to template instantiation, so
       // there is no SFINAE.

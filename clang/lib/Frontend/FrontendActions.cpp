@@ -474,6 +474,14 @@ private:
       return "TypeAliasTemplateInstantiation";
     case CodeSynthesisContext::PartialOrderingTTP:
       return "PartialOrderingTTP";
+    case CodeSynthesisContext::BuildingBuiltinDescribeCall:
+      return "BuildingBuiltinDescribeCall";
+    case CodeSynthesisContext::BuildingBuiltinVisitDataMembersCall:
+      return "BuildingBuiltinVisitDataMembersCall";
+    case CodeSynthesisContext::BuildingBuiltinVisitBasesCall:
+      return "BuildingBuiltinVisitBasesCall";
+    case CodeSynthesisContext::BuildingBuiltinVisitEnumeratorsCall:
+      return "BuildingBuiltinVisitEnumeratorsCall";
     }
     return "";
   }

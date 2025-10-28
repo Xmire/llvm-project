@@ -29,6 +29,7 @@
 #include "clang/AST/ExprObjC.h"
 #include "clang/AST/FormatString.h"
 #include "clang/AST/IgnoreExpr.h"
+#include "clang/AST/LocInfoType.h"
 #include "clang/AST/NSAPI.h"
 #include "clang/AST/NonTrivialTypeVisitor.h"
 #include "clang/AST/OperationKinds.h"
@@ -76,6 +77,7 @@
 #include "clang/Sema/SemaSystemZ.h"
 #include "clang/Sema/SemaWasm.h"
 #include "clang/Sema/SemaX86.h"
+#include "clang/Sema/Template.h"
 #include "llvm/ADT/APFloat.h"
 #include "llvm/ADT/APInt.h"
 #include "llvm/ADT/APSInt.h"
@@ -719,6 +721,444 @@ struct BuiltinDumpStructGenerator {
     return Wrapper;
   }
 };
+struct BuiltinDescribeGenerator {
+  Sema &S;
+  CallExpr *TheCall;
+  SourceLocation Loc = TheCall->getBeginLoc();
+  SmallVector<Expr *, 32> Actions;
+  DiagnosticErrorTrap ErrorTracker;
+  PrintingPolicy Policy;
+
+  BuiltinDescribeGenerator(Sema &S, CallExpr *TheCall)
+      : S(S), TheCall(TheCall), ErrorTracker(S.getDiagnostics()),
+        Policy(S.Context.getPrintingPolicy()) {
+    Policy.AnonymousTagLocations = false;
+  }
+
+  Expr *makeOpaqueValueExpr(Expr *Inner) {
+    auto *OVE = new (S.Context)
+        OpaqueValueExpr(Loc, Inner->getType(), Inner->getValueKind(),
+                        Inner->getObjectKind(), Inner);
+    Actions.push_back(OVE);
+    return OVE;
+  }
+
+  Expr *getStringLiteral(llvm::StringRef Str) {
+    Expr *Lit = S.Context.getPredefinedStringLiteralFromCache(Str);
+    // Wrap the literal in parentheses to attach a source location.
+    return new (S.Context) ParenExpr(Loc, Loc, Lit);
+  }
+
+  Expr *getConstantLiteral(const EnumDecl *ED, const llvm::APInt& value) {
+    QualType ValueType = ED->getPromotionType();
+    Expr *ValueLiteral = IntegerLiteral::Create(S.Context, value, ValueType, SourceLocation());
+    // Wrap the literal in parentheses to attach a source location.
+    return new (S.Context) ParenExpr(Loc, Loc, ValueLiteral);
+  }
+
+  bool callVisitFunction(llvm::ArrayRef<Expr *> Exprs = {}) {
+    SmallVector<Expr *, 8> Args;
+    assert(TheCall->getNumArgs() >= 2);
+    Args.reserve((TheCall->getNumArgs() - 2) + Exprs.size());
+    Args.assign(TheCall->arg_begin() + 2, TheCall->arg_end());
+    Args.insert(Args.end(), Exprs.begin(), Exprs.end());
+    // Register a note to explain why we're performing the call.
+    Sema::CodeSynthesisContext Ctx;
+    Ctx.Kind = Sema::CodeSynthesisContext::BuildingBuiltinDescribeCall;
+    Ctx.PointOfInstantiation = Loc;
+    Ctx.CallArgs = Args.data();
+    Ctx.NumCallArgs = Args.size();
+    S.pushCodeSynthesisContext(Ctx);
+    ExprResult RealCall =
+        S.BuildCallExpr(nullptr, TheCall->getArg(1),
+                        TheCall->getBeginLoc(), Args, TheCall->getRParenLoc());
+
+    S.popCodeSynthesisContext();
+    if (!RealCall.isInvalid())
+      Actions.push_back(RealCall.get());
+    // Bail out if we've hit any errors, even if we managed to build the
+    // call. We don't want to produce more than one error.
+    return RealCall.isInvalid() || ErrorTracker.hasErrorOccurred();
+  }
+
+  bool describeType(QualType QT) {
+    QT = QT.getUnqualifiedType();
+    SmallVector<Expr *, 8> args;
+    PrintingPolicy policy(S.Context.getLangOpts());
+    policy.SuppressScope = false;
+    std::string fullTypeName = QT.getAsString(Policy);
+    args.push_back(getStringLiteral(fullTypeName));
+    if (callVisitFunction(args)) {
+      return true;
+    }
+    return false;
+  }
+
+  Expr *buildWrapper() {
+    auto *Wrapper = PseudoObjectExpr::Create(S.Context, TheCall, Actions,
+                                             PseudoObjectExpr::NoResult);
+    TheCall->setType(Wrapper->getType());
+    TheCall->setValueKind(Wrapper->getValueKind());
+    return Wrapper;
+  }
+};
+
+struct BuiltinVisitDataMembersGenerator {
+  Sema& S;
+  CallExpr* TheCall;
+  SourceLocation Loc = TheCall->getBeginLoc();
+  SmallVector<Expr *, 32> Actions;
+  DiagnosticErrorTrap ErrorTracker;
+  PrintingPolicy Policy;
+  std::unique_ptr<llvm::raw_fd_ostream> File;
+
+  BuiltinVisitDataMembersGenerator(Sema &S, CallExpr *TheCall)
+      : S(S), TheCall(TheCall), ErrorTracker(S.getDiagnostics()),
+        Policy(S.Context.getPrintingPolicy()) {
+    Policy.AnonymousTagLocations = false;
+    std::error_code EC;
+  }
+
+  Expr *makeOpaqueValueExpr(Expr *Inner) {
+    auto *OVE = new (S.Context)
+        OpaqueValueExpr(Loc, Inner->getType(), Inner->getValueKind(),
+                        Inner->getObjectKind(), Inner);
+    Actions.push_back(OVE);
+    return OVE;
+  }
+
+  Expr *getStringLiteral(llvm::StringRef Str) {
+    Expr *Lit = S.Context.getPredefinedStringLiteralFromCache(Str);
+    // Wrap the literal in parentheses to attach a source location.
+    return new (S.Context) ParenExpr(Loc, Loc, Lit);
+  }
+
+  bool callVisitFunction(const RecordDecl* RD, FieldDecl* FD, llvm::ArrayRef<Expr *> Exprs = {}) {
+    if (TheCall->getNumArgs() < 2) {
+      return true;
+    }
+    Expr* FunctionExpr = TheCall->getArg(1);
+    UnresolvedLookupExpr* ULE = cast<UnresolvedLookupExpr>(FunctionExpr);
+    if (!ULE) {
+      return true;
+    }
+    TemplateArgumentListInfo TABuffer;
+    if (ULE->hasExplicitTemplateArgs()) {
+      ULE->copyTemplateArgumentsInto(TABuffer);
+    }
+    SmallVector<Expr *, 8> Args;
+    Args.reserve((TheCall->getNumArgs() - 2) + Exprs.size());
+    Args.assign(TheCall->arg_begin() + 2, TheCall->arg_end());
+    Args.insert(Args.end(), Exprs.begin(), Exprs.end());
+    FunctionDecl* OverloadDecl = nullptr;
+    { // Get suitable function overload
+      QualType PMemTy = S.Context.getMemberPointerType(FD->getType(), nullptr, dyn_cast<CXXRecordDecl>(RD));
+      TemplateArgument TA1(FD, PMemTy, true);
+      TemplateArgumentLocInfo LocInfo {};
+      TemplateArgumentLoc TA1Loc(TA1, LocInfo);
+      TABuffer.addArgument(TA1Loc);
+      if (FD->hasAttr<MetaAttr>()) {
+        MetaAttr* Attr = FD->getAttr<MetaAttr>();
+        if (Attr->getMetadataTypeLoc()) {
+          QualType MetaTy = Attr->getMetadataType();
+          TemplateArgument TA2(MetaTy);
+          TemplateArgumentLoc TA2Loc(TA2, Attr->getMetadataTypeLoc());
+          TABuffer.addArgument(TA2Loc);
+        }
+      }
+      else {
+        QualType VoidTy = S.Context.VoidTy;
+        static TypeSourceInfo* TSI = S.Context.getTrivialTypeSourceInfo(VoidTy);
+        TemplateArgument TA2(VoidTy);
+        TemplateArgumentLoc TA2Loc(TA2, TSI);
+        TABuffer.addArgument(TA2Loc);
+      }
+      bool CalleesAddressIsTaken = false;
+      OverloadCandidateSet CandidateSet(ULE->getExprLoc(), CalleesAddressIsTaken
+        ? OverloadCandidateSet::CSK_AddressOfOverloadSet
+        : OverloadCandidateSet::CSK_Normal);
+      for (auto I = ULE->decls_begin(), E = ULE->decls_end(); I != E; ++I) {
+        S.AddOverloadedCallCandidate(I.getPair(), &TABuffer, Args, CandidateSet, false, true);
+      }
+      if (ULE->requiresADL()) {
+        S.AddArgumentDependentLookupCandidates(ULE->getName(), ULE->getExprLoc(), Args, &TABuffer,
+          CandidateSet, false);
+      }
+      if (CandidateSet.empty()) {
+        return true;
+      }
+      OverloadCandidateSet::iterator BestFunction;
+      OverloadingResult BestFunctionResult = CandidateSet.BestViableFunction(S, ULE->getBeginLoc(), BestFunction);
+      if (BestFunctionResult != OverloadingResult::OR_Success) {
+        return true;
+      }
+      OverloadDecl = BestFunction->Function;
+    }
+    if (!OverloadDecl) {
+      return false;
+    }
+    DeclRefExpr* OverloadDeclRef = S.BuildDeclRefExpr(OverloadDecl, OverloadDecl->getType(), 
+      ExprValueKind::VK_LValue, OverloadDecl->getLocation());
+    { // Register a note to explain why we're performing the call.
+      Sema::CodeSynthesisContext Ctx;
+      Ctx.Kind = Sema::CodeSynthesisContext::BuildingBuiltinVisitDataMembersCall;
+      Ctx.PointOfInstantiation = Loc;
+      Ctx.CallArgs = Args.data();
+      Ctx.NumCallArgs = Args.size();
+      S.pushCodeSynthesisContext(Ctx);
+      ExprResult RealCall = S.BuildCallExpr(nullptr, OverloadDeclRef,
+        TheCall->getBeginLoc(), Args, TheCall->getRParenLoc());
+      S.popCodeSynthesisContext();
+      if (!RealCall.isInvalid()) {
+        Actions.push_back(RealCall.get());
+      }
+      return RealCall.isInvalid() || ErrorTracker.hasErrorOccurred();
+    }
+    return false;
+  }
+
+  Expr *getTypeString(QualType T) {
+    return getStringLiteral(T.getAsString(Policy));
+  }
+
+  Expr *getIntegerLiteral(int value) {
+    llvm::APInt Value = llvm::APInt(32, (uint64_t)value, true, false);
+    QualType ValueType = S.Context.IntTy;
+    Expr *ValueLiteral = IntegerLiteral::Create(S.Context, Value, ValueType, SourceLocation());
+    return new (S.Context) ParenExpr(Loc, Loc, ValueLiteral);
+  }
+
+  bool visitRecordValue(const RecordDecl *RD, Expr *E) {
+    Expr *RecordArg = makeOpaqueValueExpr(E);
+    bool RecordArgIsPtr = RecordArg->getType()->isPointerType();
+    for (auto *D : RD->decls()) {
+      auto *IFD = dyn_cast<IndirectFieldDecl>(D);
+      FieldDecl *FD = IFD ? IFD->getAnonField() : dyn_cast<FieldDecl>(D);
+      if (!FD || FD->isUnnamedBitField() || FD->isAnonymousStructOrUnion()) {
+        continue;
+      }
+      Expr* fieldNameLiteral = fieldNameLiteral = getStringLiteral(FD->getName()); 
+      llvm::SmallVector<Expr *, 5> Args {};
+      if (FD->isBitField()) {
+        continue;
+        //QualType SizeT = S.Context.getSizeType();
+        //llvm::APInt BitWidth(S.Context.getIntWidth(SizeT), FD->getBitWidthValue());
+        //Args.push_back(IntegerLiteral::Create(S.Context, BitWidth, SizeT, Loc));
+      }
+      ExprResult Field =
+          IFD ? S.BuildAnonymousStructUnionMemberReference(
+                    CXXScopeSpec(), Loc, IFD,
+                    DeclAccessPair::make(IFD, AS_public), RecordArg, Loc)
+              : S.BuildFieldReferenceExpr(
+                    RecordArg, RecordArgIsPtr, Loc, CXXScopeSpec(), FD,
+                    DeclAccessPair::make(FD, AS_public),
+                    DeclarationNameInfo(FD->getDeclName(), Loc));
+      if (Field.isInvalid()) {
+        return true;
+      }
+      Args.push_back(fieldNameLiteral);
+      Args.push_back(getIntegerLiteral((int)FD->getAccess()));
+      if (callVisitFunction(RD, FD, Args)) {
+        return true;
+      }
+    }
+    return false;
+  }
+
+  Expr *buildWrapper() {
+    auto *Wrapper = PseudoObjectExpr::Create(S.Context, TheCall, Actions,
+                                             PseudoObjectExpr::NoResult);
+    TheCall->setType(Wrapper->getType());
+    TheCall->setValueKind(Wrapper->getValueKind());
+    return Wrapper;
+  }
+};
+
+struct BuiltinVisitBasesGenerator {
+  Sema &S;
+  CallExpr *TheCall;
+  SourceLocation Loc = TheCall->getBeginLoc();
+  SmallVector<Expr *, 32> Actions;
+  DiagnosticErrorTrap ErrorTracker;
+  PrintingPolicy Policy;
+
+  BuiltinVisitBasesGenerator(Sema &S, CallExpr *TheCall)
+      : S(S), TheCall(TheCall), ErrorTracker(S.getDiagnostics()),
+        Policy(S.Context.getPrintingPolicy()) {
+    Policy.AnonymousTagLocations = false;
+  }
+
+  Expr *makeOpaqueValueExpr(Expr *Inner) {
+    auto *OVE = new (S.Context)
+        OpaqueValueExpr(Loc, Inner->getType(), Inner->getValueKind(),
+                        Inner->getObjectKind(), Inner);
+    Actions.push_back(OVE);
+    return OVE;
+  }
+
+  Expr *getStringLiteral(llvm::StringRef Str) {
+    Expr *Lit = S.Context.getPredefinedStringLiteralFromCache(Str);
+    // Wrap the literal in parentheses to attach a source location.
+    return new (S.Context) ParenExpr(Loc, Loc, Lit);
+  }
+
+  bool callVisitFunction(llvm::ArrayRef<Expr *> Exprs = {}) {
+    SmallVector<Expr *, 8> Args;
+    assert(TheCall->getNumArgs() >= 2);
+    Args.reserve((TheCall->getNumArgs() - 2) + Exprs.size());
+    Args.assign(TheCall->arg_begin() + 2, TheCall->arg_end());
+    Args.insert(Args.end(), Exprs.begin(), Exprs.end());
+
+    // Register a note to explain why we're performing the call.
+    Sema::CodeSynthesisContext Ctx;
+    Ctx.Kind = Sema::CodeSynthesisContext::BuildingBuiltinVisitBasesCall;
+    Ctx.PointOfInstantiation = Loc;
+    Ctx.CallArgs = Args.data();
+    Ctx.NumCallArgs = Args.size();
+    S.pushCodeSynthesisContext(Ctx);
+
+    ExprResult RealCall =
+        S.BuildCallExpr(/*Scope=*/nullptr, TheCall->getArg(1),
+                        TheCall->getBeginLoc(), Args, TheCall->getRParenLoc());
+
+    S.popCodeSynthesisContext();
+    if (!RealCall.isInvalid())
+      Actions.push_back(RealCall.get());
+    // Bail out if we've hit any errors, even if we managed to build the
+    // call. We don't want to produce more than one error.
+    return RealCall.isInvalid() || ErrorTracker.hasErrorOccurred();
+  }
+
+  Expr *getTypeString(QualType T) {
+    return getStringLiteral(T.getAsString(Policy));
+  }
+
+  bool visitUnnamedRecord(const RecordDecl *RD, Expr *E) {
+    Expr *TypeLit = getTypeString(S.Context.getRecordType(RD));
+    if (callVisitFunction({E, TypeLit}))
+      return true;
+    return false;
+  }
+
+  // Dump a record value. E should be a pointer or lvalue referring to an RD.
+  bool visitRecordValue(const RecordDecl *RD, Expr *E) {
+    // Build an OpaqueValueExpr so we can refer to E more than once without
+    // triggering re-evaluation.
+    Expr *RecordArg = makeOpaqueValueExpr(E);
+    bool RecordArgIsPtr = RecordArg->getType()->isPointerType();
+    // Dump each base class, regardless of whether they're aggregates.
+    if (const auto *CXXRD = dyn_cast<CXXRecordDecl>(RD)) {
+      for (const auto &Base : CXXRD->bases()) {
+        QualType BaseType =
+            RecordArgIsPtr ? S.Context.getPointerType(Base.getType())
+                           : S.Context.getLValueReferenceType(Base.getType());
+        ExprResult BasePtr = S.BuildCStyleCastExpr(
+            Loc, S.Context.getTrivialTypeSourceInfo(BaseType, Loc), Loc,
+            RecordArg);
+        if (BasePtr.isInvalid() ||
+            visitUnnamedRecord(Base.getType()->getAsRecordDecl(), BasePtr.get()))
+          return true;
+      }
+    }
+    return false;
+  }
+
+  Expr *buildWrapper() {
+    auto *Wrapper = PseudoObjectExpr::Create(S.Context, TheCall, Actions,
+                                             PseudoObjectExpr::NoResult);
+    TheCall->setType(Wrapper->getType());
+    TheCall->setValueKind(Wrapper->getValueKind());
+    return Wrapper;
+  }
+};
+
+struct BuiltinVisitEnumeratorsGenerator {
+  Sema &S;
+  CallExpr *TheCall;
+  SourceLocation Loc = TheCall->getBeginLoc();
+  SmallVector<Expr *, 32> Actions;
+  DiagnosticErrorTrap ErrorTracker;
+  PrintingPolicy Policy;
+
+  BuiltinVisitEnumeratorsGenerator(Sema &S, CallExpr *TheCall)
+      : S(S), TheCall(TheCall), ErrorTracker(S.getDiagnostics()),
+        Policy(S.Context.getPrintingPolicy()) {
+    Policy.AnonymousTagLocations = false;
+  }
+
+  Expr *makeOpaqueValueExpr(Expr *Inner) {
+    auto *OVE = new (S.Context)
+        OpaqueValueExpr(Loc, Inner->getType(), Inner->getValueKind(),
+                        Inner->getObjectKind(), Inner);
+    Actions.push_back(OVE);
+    return OVE;
+  }
+
+  Expr *getStringLiteral(llvm::StringRef Str) {
+    Expr *Lit = S.Context.getPredefinedStringLiteralFromCache(Str);
+    // Wrap the literal in parentheses to attach a source location.
+    return new (S.Context) ParenExpr(Loc, Loc, Lit);
+  }
+
+  Expr *getConstantLiteral(const EnumDecl *ED, EnumConstantDecl* ECD) {
+    llvm::APSInt Value = ECD->getInitVal();
+    QualType ValueType = ED->getPromotionType();
+    Expr *ValueLiteral = IntegerLiteral::Create(S.Context, Value, ValueType, SourceLocation());
+    // Wrap the literal in parentheses to attach a source location.
+    return new (S.Context) ParenExpr(Loc, Loc, ValueLiteral);
+  }
+
+  bool callVisitFunction(llvm::ArrayRef<Expr *> Exprs = {}) {
+    SmallVector<Expr *, 8> Args;
+    assert(TheCall->getNumArgs() >= 2);
+    Args.reserve((TheCall->getNumArgs() - 2) + Exprs.size());
+    Args.assign(TheCall->arg_begin() + 2, TheCall->arg_end());
+    Args.insert(Args.end(), Exprs.begin(), Exprs.end());
+
+    // Register a note to explain why we're performing the call.
+    Sema::CodeSynthesisContext Ctx;
+    Ctx.Kind = Sema::CodeSynthesisContext::BuildingBuiltinVisitEnumeratorsCall;
+    Ctx.PointOfInstantiation = Loc;
+    Ctx.CallArgs = Args.data();
+    Ctx.NumCallArgs = Args.size();
+    S.pushCodeSynthesisContext(Ctx);
+
+    ExprResult RealCall =
+        S.BuildCallExpr(/*Scope=*/nullptr, TheCall->getArg(1),
+                        TheCall->getBeginLoc(), Args, TheCall->getRParenLoc());
+
+    S.popCodeSynthesisContext();
+    if (!RealCall.isInvalid())
+      Actions.push_back(RealCall.get());
+    // Bail out if we've hit any errors, even if we managed to build the
+    // call. We don't want to produce more than one error.
+    return RealCall.isInvalid() || ErrorTracker.hasErrorOccurred();
+  }
+
+  bool visitEnumConstant(const EnumDecl *ED, EnumConstantDecl *ECD) {
+    Expr *ConstantLiteral = getConstantLiteral(ED, ECD);
+    Expr *NameLiteral = getStringLiteral(ECD->getName());
+    if (callVisitFunction({ConstantLiteral, NameLiteral}))
+      return true;
+    return false;
+  }
+
+  bool visitEnum(const EnumDecl *ED, Expr *E) {
+    for (const auto &ECD : ED->enumerators()) {
+      if (visitEnumConstant(ED, ECD))
+        return true;
+    }
+    return false;
+  }
+
+  Expr *buildWrapper() {
+    auto *Wrapper = PseudoObjectExpr::Create(S.Context, TheCall, Actions,
+                                             PseudoObjectExpr::NoResult);
+    TheCall->setType(Wrapper->getType());
+    TheCall->setValueKind(Wrapper->getValueKind());
+    return Wrapper;
+  }
+};
 } // namespace
 
 static ExprResult BuiltinDumpStruct(Sema &S, CallExpr *TheCall) {
@@ -785,6 +1225,234 @@ static ExprResult BuiltinDumpStruct(Sema &S, CallExpr *TheCall) {
     return ExprError();
 
   return Generator.buildWrapper();
+}
+
+static ExprResult BuiltinDescribe(Sema &S, CallExpr *TheCall) {
+  if (S.checkArgCountAtLeast(TheCall, 2))
+    return ExprError();
+
+  ExprResult ArgResult = S.DefaultLvalueConversion(TheCall->getArg(0));
+  if (ArgResult.isInvalid())
+    return ExprError();
+  TheCall->setArg(0, ArgResult.get());
+
+  // First argument should be a pointer to a struct or pointer to enum.
+  QualType ArgType = ArgResult.get()->getType();
+  // Second argument is a callable, but we can't fully validate it until we try
+  // calling it.
+  QualType FnArgType = TheCall->getArg(1)->getType();
+  if (!FnArgType->isFunctionType() && !FnArgType->isFunctionPointerType() &&
+      !FnArgType->isBlockPointerType() &&
+      !(S.getLangOpts().CPlusPlus && FnArgType->isRecordType())) {
+    auto *BT = FnArgType->getAs<BuiltinType>();
+    switch (BT ? BT->getKind() : BuiltinType::Void) {
+    case BuiltinType::Dependent:
+    case BuiltinType::Overload:
+    case BuiltinType::BoundMember:
+    case BuiltinType::PseudoObject:
+    case BuiltinType::UnknownAny:
+    case BuiltinType::BuiltinFn:
+      // This might be a callable.
+      break;
+
+    default:
+      S.Diag(TheCall->getArg(1)->getBeginLoc(),
+             diag::err_expected_callable_argument)
+          << 2 << TheCall->getDirectCallee() << FnArgType;
+      return ExprError();
+    }
+  }
+  BuiltinDescribeGenerator Generator(S, TheCall);
+  if (Generator.describeType(ArgType))
+    return ExprError();
+
+  return Generator.buildWrapper();
+}
+
+static ExprResult BuiltinVisitDataMembers(Sema &S, CallExpr *TheCall) {
+  if (S.checkArgCountAtLeast(TheCall, 2))
+    return ExprError();
+
+  ExprResult PtrArgResult = S.DefaultLvalueConversion(TheCall->getArg(0));
+  if (PtrArgResult.isInvalid())
+    return ExprError();
+  TheCall->setArg(0, PtrArgResult.get());
+
+  // First argument should be a pointer to a struct.
+  QualType PtrArgType = PtrArgResult.get()->getType();
+  if (!PtrArgType->isPointerType() ||
+      !PtrArgType->getPointeeType()->isRecordType()) {
+    S.Diag(PtrArgResult.get()->getBeginLoc(),
+           diag::err_expected_struct_pointer_argument)
+        << 1 << TheCall->getDirectCallee() << PtrArgType;
+    return ExprError();
+  }
+  QualType Pointee = PtrArgType->getPointeeType();
+  const RecordDecl *RD = Pointee->getAsRecordDecl();
+  // Try to instantiate the class template as appropriate; otherwise, access to
+  // its data() may lead to a crash.
+  if (S.RequireCompleteType(PtrArgResult.get()->getBeginLoc(), Pointee,
+                            diag::err_incomplete_type))
+    return ExprError();
+  // Second argument is a callable, but we can't fully validate it until we try
+  // calling it.
+  QualType FnArgType = TheCall->getArg(1)->getType();
+  if (!FnArgType->isFunctionType() && !FnArgType->isFunctionPointerType() &&
+      !FnArgType->isBlockPointerType() &&
+      !(S.getLangOpts().CPlusPlus && FnArgType->isRecordType())) {
+    auto *BT = FnArgType->getAs<BuiltinType>();
+    switch (BT ? BT->getKind() : BuiltinType::Void) {
+    case BuiltinType::Dependent:
+    case BuiltinType::Overload:
+    case BuiltinType::BoundMember:
+    case BuiltinType::PseudoObject:
+    case BuiltinType::UnknownAny:
+    case BuiltinType::BuiltinFn:
+      // This might be a callable.
+      break;
+
+    default:
+      S.Diag(TheCall->getArg(1)->getBeginLoc(),
+             diag::err_expected_callable_argument)
+          << 2 << TheCall->getDirectCallee() << FnArgType;
+      return ExprError();
+    }
+  }
+
+  BuiltinVisitDataMembersGenerator Generator(S, TheCall);
+
+  // Wrap parentheses around the given pointer. This is not necessary for
+  // correct code generation, but it means that when we pretty-print the call
+  // arguments in our diagnostics we will produce '(&s)->n' instead of the
+  // incorrect '&s->n'.
+  Expr *PtrArg = PtrArgResult.get();
+  PtrArg = new (S.Context)
+      ParenExpr(PtrArg->getBeginLoc(),
+                S.getLocForEndOfToken(PtrArg->getEndLoc()), PtrArg);
+  if (Generator.visitRecordValue(RD, PtrArg))
+    return ExprError();
+  return Generator.buildWrapper();
+}
+
+static ExprResult BuiltinVisitBases(Sema &S, CallExpr *TheCall) {
+  if (S.checkArgCountAtLeast(TheCall, 2))
+    return ExprError();
+
+  ExprResult PtrArgResult = S.DefaultLvalueConversion(TheCall->getArg(0));
+  if (PtrArgResult.isInvalid())
+    return ExprError();
+  TheCall->setArg(0, PtrArgResult.get());
+
+  // First argument should be a pointer to a struct.
+  QualType PtrArgType = PtrArgResult.get()->getType();
+  if (!PtrArgType->isPointerType() ||
+      !PtrArgType->getPointeeType()->isRecordType()) {
+    S.Diag(PtrArgResult.get()->getBeginLoc(),
+           diag::err_expected_struct_pointer_argument)
+        << 1 << TheCall->getDirectCallee() << PtrArgType;
+    return ExprError();
+  }
+  QualType Pointee = PtrArgType->getPointeeType();
+  const RecordDecl *RD = Pointee->getAsRecordDecl();
+  // Try to instantiate the class template as appropriate; otherwise, access to
+  // its data() may lead to a crash.
+  if (S.RequireCompleteType(PtrArgResult.get()->getBeginLoc(), Pointee,
+                            diag::err_incomplete_type))
+    return ExprError();
+  // Second argument is a callable, but we can't fully validate it until we try
+  // calling it.
+  QualType FnArgType = TheCall->getArg(1)->getType();
+  if (!FnArgType->isFunctionType() && !FnArgType->isFunctionPointerType() &&
+      !FnArgType->isBlockPointerType() &&
+      !(S.getLangOpts().CPlusPlus && FnArgType->isRecordType())) {
+    auto *BT = FnArgType->getAs<BuiltinType>();
+    switch (BT ? BT->getKind() : BuiltinType::Void) {
+    case BuiltinType::Dependent:
+    case BuiltinType::Overload:
+    case BuiltinType::BoundMember:
+    case BuiltinType::PseudoObject:
+    case BuiltinType::UnknownAny:
+    case BuiltinType::BuiltinFn:
+      // This might be a callable.
+      break;
+
+    default:
+      S.Diag(TheCall->getArg(1)->getBeginLoc(),
+             diag::err_expected_callable_argument)
+          << 2 << TheCall->getDirectCallee() << FnArgType;
+      return ExprError();
+    }
+  }
+
+  BuiltinVisitBasesGenerator Generator(S, TheCall);
+
+  // Wrap parentheses around the given pointer. This is not necessary for
+  // correct code generation, but it means that when we pretty-print the call
+  // arguments in our diagnostics we will produce '(&s)->n' instead of the
+  // incorrect '&s->n'.
+  Expr *PtrArg = PtrArgResult.get();
+  PtrArg = new (S.Context)
+      ParenExpr(PtrArg->getBeginLoc(),
+                S.getLocForEndOfToken(PtrArg->getEndLoc()), PtrArg);
+  if (Generator.visitRecordValue(RD, PtrArg))
+    return ExprError();
+
+  return Generator.buildWrapper();
+}
+
+static ExprResult BuiltinVisitEnumerators(Sema &S, CallExpr *TheCall) {
+  if (S.checkArgCountAtLeast(TheCall, 2))
+    return ExprError();
+
+  ExprResult ArgResult = TheCall->getArg(0);
+  if (ArgResult.isInvalid())
+    return ExprError();
+  TheCall->setArg(0, ArgResult.get());
+
+  // First argument should be an enum.
+  QualType ArgType = ArgResult.get()->getType();
+  if (!ArgType->isEnumeralType()) {
+    S.Diag(ArgResult.get()->getBeginLoc(),
+           diag::err_expected_enum_argument)
+        << 1 << TheCall->getDirectCallee() << ArgType;
+    return ExprError();
+  }
+  const EnumDecl *ED = dyn_cast_or_null<EnumDecl>(ArgType->getAsTagDecl());
+  // Try to instantiate the class template as appropriate; otherwise, access to
+  // its data() may lead to a crash.
+  if (S.RequireCompleteType(ArgResult.get()->getBeginLoc(), ArgType,
+                            diag::err_incomplete_type))
+    return ExprError();
+  // Second argument is a callable, but we can't fully validate it until we try
+  // calling it.
+  QualType FnArgType = TheCall->getArg(1)->getType();
+  if (!FnArgType->isFunctionType() && !FnArgType->isFunctionPointerType() &&
+      !FnArgType->isBlockPointerType() &&
+      !(S.getLangOpts().CPlusPlus && FnArgType->isRecordType())) {
+    auto *BT = FnArgType->getAs<BuiltinType>();
+    switch (BT ? BT->getKind() : BuiltinType::Void) {
+    case BuiltinType::Dependent:
+    case BuiltinType::Overload:
+    case BuiltinType::BoundMember:
+    case BuiltinType::PseudoObject:
+    case BuiltinType::UnknownAny:
+    case BuiltinType::BuiltinFn:
+      // This might be a callable.
+      break;
+
+    default:
+      S.Diag(TheCall->getArg(1)->getBeginLoc(),
+             diag::err_expected_callable_argument)
+          << 2 << TheCall->getDirectCallee() << FnArgType;
+      return ExprError();
+    }
+  }
+
+  BuiltinVisitEnumeratorsGenerator Generator(S, TheCall);
+  if (Generator.visitEnum(ED, ArgResult.get()))
+     return ExprError();
+ 
+   return Generator.buildWrapper();
 }
 
 static bool BuiltinCallWithStaticChain(Sema &S, CallExpr *BuiltinCall) {
@@ -2761,6 +3429,14 @@ Sema::CheckBuiltinFunctionCall(FunctionDecl *FDecl, unsigned BuiltinID,
   }
   case Builtin::BI__builtin_dump_struct:
     return BuiltinDumpStruct(*this, TheCall);
+  case Builtin::BI__builtin_describe:
+    return BuiltinDescribe(*this, TheCall);
+  case Builtin::BI__builtin_visit_data_members:
+    return BuiltinVisitDataMembers(*this, TheCall);
+  case Builtin::BI__builtin_visit_bases:
+    return BuiltinVisitBases(*this, TheCall);
+  case Builtin::BI__builtin_visit_enumerators:
+    return BuiltinVisitEnumerators(*this, TheCall);
   case Builtin::BI__builtin_expect_with_probability: {
     // We first want to ensure we are called with 3 arguments
     if (checkArgCount(TheCall, 3))

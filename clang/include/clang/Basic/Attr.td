@@ -5223,3 +5223,10 @@ def NonString : InheritableAttr {
   let Subjects = SubjectList<[Var, Field]>;
   let Documentation = [NonStringDocs];
 }
+
+def Meta : InheritableAttr {
+  let Spellings = [CXX11<"", "meta", 200809>];
+  let Subjects = SubjectList<[Field]>;
+  let Args = [TypeArgument<"MetadataType", 0>];
+  let Documentation = [MetaAttrDocs];
+}
